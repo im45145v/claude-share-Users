@@ -24,7 +24,6 @@ import { launchClaude } from "./launch";
 import { logger } from "./logger";
 import { parseConnectUrl } from "./pairing";
 import {
-  findConnectionByServerUrl,
   hasAgreedToTerms,
   loadConnections,
   pruneExpiredConnections,
@@ -49,23 +48,45 @@ await checkForUpdate();
 // ── Arg parsing ───────────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
+const noSave = args.includes("--no-save");
 
 // Identify which arg indices belong to claude-connect itself
 const ownIdxs = new Set<number>();
 args.forEach((a, i) => {
   if (a === "--list" || a === "-l") ownIdxs.add(i);
   if (a === "--cleanup") ownIdxs.add(i);
+  if (a === "--no-save") ownIdxs.add(i);
   if (a === "--reconnect" || a === "-r") {
     ownIdxs.add(i);
     if (args[i + 1] && !args[i + 1].startsWith("-")) ownIdxs.add(i + 1);
   }
   if (a.startsWith("--share=")) ownIdxs.add(i);
+  if (a === "--share") {
+    ownIdxs.add(i);
+    if (args[i + 1] && !args[i + 1].startsWith("-")) ownIdxs.add(i + 1);
+  }
 });
 
 const claudeArgs = args.filter((_, i) => !ownIdxs.has(i));
-const shareArg = args.find((a) => a.startsWith("--share="));
+const shareIndex = args.findIndex((a) => a === "--share" || a.startsWith("--share="));
+const shareArg = shareIndex === -1
+  ? null
+  : args[shareIndex] === "--share"
+    ? (args[shareIndex + 1] ?? "")
+    : args[shareIndex].slice("--share=".length);
 
-pruneExpiredConnections();
+if (!noSave) pruneExpiredConnections();
+
+if (noSave && (args.includes("--list") || args.includes("-l") ||
+    args.includes("--reconnect") || args.includes("-r"))) {
+  p.log.error("--no-save cannot be combined with saved-connection commands.");
+  process.exit(1);
+}
+
+if (noSave && !(await platform().credentialsExist())) {
+  p.log.error("Non-persistent mode requires existing Claude credentials; log in under a separate OS account first.");
+  process.exit(1);
+}
 
 if (!hasAgreedToTerms()) {
   p.intro("claude-connect");
@@ -85,7 +106,7 @@ if (!hasAgreedToTerms()) {
     p.cancel("Cancelled.");
     process.exit(0);
   }
-  saveTermsAgreed();
+  if (!noSave) saveTermsAgreed();
 }
 
 // ── Dispatch ──────────────────────────────────────────────────────────────────
@@ -94,8 +115,8 @@ if (args[0] === "--list" || args[0] === "-l") {
   await listFlow();
 } else if (args[0] === "--reconnect" || args[0] === "-r") {
   await reconnectFlow(args[1], claudeArgs);
-} else if (shareArg) {
-  const connectUrl = shareArg.slice("--share=".length).trim();
+} else if (shareArg !== null) {
+  const connectUrl = shareArg.trim();
   const parsed = parseConnectUrl(connectUrl);
   if (!parsed) {
     p.log.error(
@@ -104,31 +125,11 @@ if (args[0] === "--list" || args[0] === "-l") {
     process.exit(1);
   }
 
-  // Check if we already have credentials for this sharer
-  const existing = findConnectionByServerUrl(parsed.serverUrl);
-  if (existing) {
-    const resolved = await resolveActiveUrl(existing);
-    if (resolved.alive && resolved.sessionId === existing.sessionId) {
-      // Same session still running — skip pairing entirely
-      p.intro("claude-connect");
-      p.log.info(`Resuming existing connection for ${existing.systemName}`);
-      await launchClaude(
-        resolved.url,
-        existing.caPem,
-        existing,
-        claudeArgs,
-        existing.sharerAccount ?? null,
-      );
-    } else {
-      // Session changed, server restarted, or TLS cert rotated (sharer restart generates
-      // a new CA, so the old caPem fails verification and health returns alive=false).
-      // The user provided an explicit new URL, so always attempt fresh pairing — if the
-      // sharer is truly offline, pairFlow will fail with a network error naturally.
-      await pairFlow(parsed, claudeArgs);
-    }
-  } else {
-    await pairFlow(parsed, claudeArgs);
-  }
+  // An explicit one-time link belongs to this enrollment, not an earlier user
+  // who happened to connect to the same server on this computer.
+  await pairFlow(parsed, claudeArgs, !noSave);
+} else if (noSave) {
+  await pairFlow(undefined, claudeArgs, false);
 } else {
   // No --share flag: check for active saved connections first
   const saved = loadConnections();
@@ -159,7 +160,7 @@ if (args[0] === "--list" || args[0] === "-l") {
         options: [
           ...active.map((r) => ({
             value: r.conn.id,
-            label: r.conn.systemName,
+            label: `${r.conn.userName ?? "legacy user"} — ${r.conn.systemName}`,
             hint: r.url,
           })),
           {

@@ -5,6 +5,8 @@ import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
 
 import { toBase58 } from "@shared/base58";
 import type { ConnectionFile, SharerAccount } from "@shared/types";
+import { AccessRegistry } from "./access";
+import { UserStore } from "./users";
 
 function randomBytes(n: number): Uint8Array {
   return webcrypto.getRandomValues(new Uint8Array(n));
@@ -21,6 +23,7 @@ export interface MachineSession {
 
 export interface Machine {
   id: string;
+  userId: string;
   name: string;
   pairedAt: Date;
   sessions: Map<string, MachineSession>;
@@ -36,29 +39,56 @@ export interface Session {
   pairingCode: string;
   /** True after a machine successfully pairs with this code */
   pairingCodeUsed: boolean;
+  pairingUserId: string | null;
   sharedUntil: Date;
   machines: Map<string, Machine>;
   status: SessionStatus;
   createdAt: Date;
   pairingAttempts: Map<string, number>;
+  users: UserStore;
+  access: AccessRegistry;
+  unsubscribeUsers: () => void;
 }
 
 let currentSession: Session | null = null;
 
-export function createSession(durationMs: number): Session {
+export function createSession(durationMs: number, users = new UserStore()): Session {
   const key = randomBytes(32);
+  const sharedUntil = new Date(Date.now() + durationMs);
   currentSession = {
     id: crypto.randomUUID(),
     key,
     pairingCode: toBase58(key),
-    pairingCodeUsed: false,
-    sharedUntil: new Date(Date.now() + durationMs),
+    pairingCodeUsed: true,
+    pairingUserId: null,
+    sharedUntil,
     machines: new Map(),
     status: "waiting",
     createdAt: new Date(),
     pairingAttempts: new Map(),
+    users,
+    access: new AccessRegistry(users, sharedUntil),
+    unsubscribeUsers: () => {},
   };
-  return currentSession;
+  const session = currentSession;
+  session.unsubscribeUsers = users.subscribe((user) => {
+    if (user.id === session.pairingUserId && user.status !== "enabled") {
+      session.key.fill(0);
+      session.pairingCode = "";
+      session.pairingCodeUsed = true;
+      session.pairingUserId = null;
+    }
+  });
+  session.access.onClose((id) => {
+    for (const machine of session.machines.values()) {
+      const active = machine.sessions.get(id);
+      if (active) {
+        active.active = false;
+        active.lastActiveAt = new Date();
+      }
+    }
+  });
+  return session;
 }
 
 export function getSession(): Session | null {
@@ -66,11 +96,15 @@ export function getSession(): Session | null {
 }
 
 /** Generates a fresh pairing code + key, allowing one more machine to pair. */
-export function regeneratePairingCode(session: Session): void {
+export function regeneratePairingCode(session: Session, userId: string): void {
+  const user = session.users.get(userId);
+  if (!user || user.status !== "enabled") throw new Error("User is disabled or revoked");
   const newKey = randomBytes(32);
+  session.key.fill(0);
   session.key = newKey;
   session.pairingCode = toBase58(newKey);
   session.pairingCodeUsed = false;
+  session.pairingUserId = userId;
   session.pairingAttempts.clear();
 }
 
@@ -85,13 +119,15 @@ export function encryptConnectionFile(session: Session, file: ConnectionFile): s
 
 /** Constant-time pairing code check. Returns false if already used or brute-forced. */
 export function checkPairingCode(session: Session, ip: string, code: string): boolean {
-  if (session.pairingCodeUsed) return false;
+  if (session.pairingCodeUsed || !session.pairingUserId) return false;
 
   const attempts = session.pairingAttempts.get(ip) ?? 0;
-  if (attempts >= 5) return false;
+  if (attempts >= (ip === "unknown" ? 20 : 5)) return false;
 
   const expected = Buffer.from(session.pairingCode.slice(0, 5), "utf8");
-  const provided = Buffer.from(code.slice(0, 5).padEnd(5, "\0"), "utf8");
+  const provided = /^[1-9A-HJ-NP-Za-km-z]{5}$/.test(code)
+    ? Buffer.from(code, "utf8")
+    : Buffer.alloc(5);
   const match = crypto.timingSafeEqual(expected, provided);
 
   if (!match) session.pairingAttempts.set(ip, attempts + 1);
@@ -108,12 +144,15 @@ function deduplicateName(session: Session, baseName: string): string {
 
 /** Creates a Machine entry and burns the current pairing code (one-time use). */
 export function addMachine(session: Session, name: string): Machine {
+  if (!session.pairingUserId) throw new Error("No active invitation");
+  const { enrollment, password } = session.access.enroll(session.pairingUserId, name);
   const machine: Machine = {
-    id: crypto.randomUUID(),
+    id: enrollment.id,
+    userId: enrollment.userId,
     name: deduplicateName(session, name),
     pairedAt: new Date(),
     sessions: new Map(),
-    proxyPass: Buffer.from(randomBytes(16)).toString("hex"),
+    proxyPass: password,
   };
   session.machines.set(machine.id, machine);
   session.pairingCodeUsed = true;
@@ -121,57 +160,14 @@ export function addMachine(session: Session, name: string): Machine {
   return machine;
 }
 
-/** Returns true if the Proxy-Authorization header matches any active machine. */
-export function checkMachineAuth(session: Session, authHeader: string): boolean {
-  for (const machine of session.machines.values()) {
-    const expected = "Basic " + Buffer.from(`${machine.id}:${machine.proxyPass}`).toString("base64");
-    if (authHeader === expected) return true;
-  }
-  return false;
-}
-
-export function addMachineSession(session: Session, machineId: string): MachineSession | null {
-  const machine = session.machines.get(machineId);
-  if (!machine) return null;
-  const ms: MachineSession = {
-    id: crypto.randomUUID(),
-    startedAt: new Date(),
-    lastActiveAt: new Date(),
-    active: true,
-  };
-  machine.sessions.set(ms.id, ms);
-  return ms;
-}
-
-export function endMachineSession(
-  session: Session,
-  machineId: string,
-  sessionId: string,
-): boolean {
-  const ms = session.machines.get(machineId)?.sessions.get(sessionId);
-  if (!ms) return false;
-  ms.active = false;
-  ms.lastActiveAt = new Date();
-  return true;
-}
-
-export function heartbeatMachineSession(
-  session: Session,
-  machineId: string,
-  sessionId: string,
-): boolean {
-  const ms = session.machines.get(machineId)?.sessions.get(sessionId);
-  if (!ms?.active) return false;
-  ms.lastActiveAt = new Date();
-  return true;
-}
-
 export function isSessionExpired(session: Session): boolean {
-  return Date.now() > session.sharedUntil.getTime();
+  return Date.now() >= session.sharedUntil.getTime();
 }
 
 export function destroySession(): void {
   if (currentSession) {
+    currentSession.access.dispose();
+    currentSession.unsubscribeUsers();
     currentSession.key.fill(0);
     currentSession = null;
   }

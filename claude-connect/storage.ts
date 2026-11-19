@@ -11,9 +11,8 @@ export const CONNECTIONS_DIR = path.join(CLAUDE_SHARE_DIR, "connections");
 const CONFIG_FILE = path.join(CLAUDE_SHARE_DIR, "config.json");
 
 export function ensureConnectionsDir() {
-  fs.mkdirSync(CONNECTIONS_DIR, { recursive: true });
+  fs.mkdirSync(CONNECTIONS_DIR, { recursive: true, mode: 0o700 });
 }
-
 export function connectionPath(id: string) {
   const resolved = path.resolve(CONNECTIONS_DIR, `${id}.json`);
   if (!resolved.startsWith(CONNECTIONS_DIR + path.sep)) {
@@ -39,11 +38,11 @@ function writeConfig(config: ReceiverConfig): void {
   });
 }
 
-export function getDeviceName(): string {
+export function getDeviceName(persist = true): string {
   const saved = readConfig();
   if (saved?.deviceName) return saved.deviceName;
   const name = os.hostname();
-  writeConfig({ deviceName: name });
+  if (persist) writeConfig({ deviceName: name });
   return name;
 }
 
@@ -57,6 +56,15 @@ export function saveTermsAgreed(): void {
 }
 
 // ── Connection persistence ────────────────────────────────────────────────────
+
+export function saveConnection(connection: SavedConnection): void {
+  ensureConnectionsDir();
+  fs.writeFileSync(
+    connectionPath(connection.id),
+    JSON.stringify(connection, null, 2),
+    { mode: 0o600, flag: "wx" },
+  );
+}
 
 export function loadConnections(): SavedConnection[] {
   ensureConnectionsDir();
@@ -97,16 +105,4 @@ export function pruneExpiredConnections(): void {
       } catch {}
     }
   }
-}
-
-export function findConnectionByServerUrl(
-  serverUrl: string,
-): SavedConnection | null {
-  const all = loadConnections().filter(
-    (c) => c.lanServerUrl === serverUrl || c.publicServerUrl === serverUrl,
-  );
-  if (all.length === 0) return null;
-  return all.sort(
-    (a, b) => new Date(b.savedAt).getTime() - new Date(a.savedAt).getTime(),
-  )[0];
 }

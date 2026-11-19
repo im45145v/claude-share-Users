@@ -65,6 +65,8 @@ export interface MitmProxy {
   caCertPem: string;
   /** TLS server cert for the API port, signed by the MITM CA */
   serverCert: ServerCert;
+  /** Disconnect all tunnels belonging to a terminated user session. */
+  closeSession(sessionId: string): void;
   close(): void;
 }
 
@@ -74,7 +76,7 @@ export interface MitmProxy {
  */
 export async function createMitmProxy(
   lanIp: string | null = null,
-  checkAuth: (authHeader: string) => boolean = () => false,
+  checkAuth: (authHeader: string) => string | null = () => null,
   publicHostname: string = "bore.pub",
 ): Promise<MitmProxy> {
   const sslCaDir = await fs.promises.mkdtemp(
@@ -85,6 +87,7 @@ export async function createMitmProxy(
     let proxyPort = 0;
     let proxyReady = false;
     const pendingSockets: net.Socket[] = [];
+    const sessionSockets = new Map<string, Set<net.Socket>>();
 
     const proxy = new Proxy();
     proxy.use(Proxy.gunzip);
@@ -162,6 +165,7 @@ export async function createMitmProxy(
 
       delete ctx.proxyToServerRequestOptions.headers["x-forwarded-for"];
       delete ctx.proxyToServerRequestOptions.headers["x-real-ip"];
+      delete ctx.proxyToServerRequestOptions.headers["proxy-authorization"];
 
       callback();
     });
@@ -224,7 +228,8 @@ export async function createMitmProxy(
     proxy.onConnect(
       (req: any, socket: any, head: any, callback: () => void) => {
         const connectAuth = req.headers["proxy-authorization"] ?? "";
-        if (!checkAuth(connectAuth)) {
+        const sessionId = checkAuth(connectAuth);
+        if (!sessionId) {
           socket.write(
             "HTTP/1.1 407 Proxy Authentication Required\r\n" +
               'Proxy-Authenticate: Basic realm="claude-share"\r\n' +
@@ -234,6 +239,13 @@ export async function createMitmProxy(
           socket.destroy();
           return;
         }
+        const sockets = sessionSockets.get(sessionId) ?? new Set<net.Socket>();
+        sessionSockets.set(sessionId, sockets);
+        sockets.add(socket);
+        socket.on("close", () => {
+          sockets.delete(socket);
+          if (sockets.size === 0) sessionSockets.delete(sessionId);
+        });
 
         const [hostname, portStr] = ((req.url as string) ?? "").split(":");
         if (INTERCEPT_DOMAINS.has(hostname)) {
@@ -251,6 +263,7 @@ export async function createMitmProxy(
         });
         upstream.on("error", () => socket.destroy());
         socket.on("error", () => upstream.destroy());
+        socket.on("close", () => upstream.destroy());
       },
     );
 
@@ -291,7 +304,16 @@ export async function createMitmProxy(
                 pendingSockets.push(socket);
               }
             },
+            closeSession(sessionId) {
+              const sockets = sessionSockets.get(sessionId);
+              if (!sockets) return;
+              sessionSockets.delete(sessionId);
+              for (const socket of sockets) socket.destroy();
+            },
             close() {
+              for (const sockets of sessionSockets.values())
+                for (const socket of sockets) socket.destroy();
+              sessionSockets.clear();
               proxy.close();
               fs.rm(sslCaDir, { recursive: true, force: true }, () => {});
             },
@@ -306,6 +328,8 @@ export async function createMitmProxy(
       upstream.pipe(socket);
       socket.on("error", () => upstream.destroy());
       upstream.on("error", () => socket.destroy());
+      socket.on("close", () => upstream.destroy());
+      upstream.on("close", () => socket.destroy());
     }
   });
 }
