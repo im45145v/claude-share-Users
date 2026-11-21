@@ -31,7 +31,7 @@ export async function reconnectFlow(
       message: "Choose a connection:",
       options: connections.map((c) => ({
         value: c.id,
-        label: `${c.systemName} — ${c.lanServerUrl ?? c.publicServerUrl ?? ""}`,
+        label: `${c.userName ?? "legacy user"} — ${c.systemName} — ${c.lanServerUrl ?? c.publicServerUrl ?? ""}`,
         hint: `saved ${new Date(c.savedAt).toLocaleDateString()}`,
       })),
     });

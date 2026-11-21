@@ -47,7 +47,6 @@ import {
   destroySession,
   isSessionExpired,
   getSession,
-  checkMachineAuth,
   type SharerAccount,
 } from "./session/manager";
 import { App } from "./tui/App";
@@ -245,11 +244,19 @@ async function main() {
     lanIp,
     (auth) => {
       const session = getSession();
-      return session ? checkMachineAuth(session, auth) : false;
+      return session?.access.authenticateProxy(auth)?.id ?? null;
     },
     boreServer,
   );
   logger.info("MITM proxy ready");
+  session.access.onClose((sessionId) => mitmProxy.closeSession(sessionId));
+  const sessionSweep = setInterval(() => session.access.sweep(), 5_000);
+  sessionSweep.unref();
+  const sessionExpiry = setTimeout(
+    () => session.access.sweep(),
+    Math.max(0, session.sharedUntil.getTime() - Date.now()),
+  );
+  sessionExpiry.unref();
 
   // Mutable — publicUrl is filled in after the tunnel starts
   const urls = { public: null as string | null, lan: lanUrl };
@@ -421,6 +428,8 @@ async function main() {
   }
 
   function cleanup() {
+    clearInterval(sessionSweep);
+    clearTimeout(sessionExpiry);
     mitmProxy.close();
     tunnel.close();
     detector.close();

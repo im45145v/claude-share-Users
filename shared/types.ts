@@ -15,4 +15,5 @@ export interface ConnectionFile {
   systemName: string;
   proxyUser: string;
   proxyPass: string;
+  userName?: string;
 }

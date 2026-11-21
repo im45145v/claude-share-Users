@@ -52,8 +52,13 @@ const PLACEHOLDER_CREDENTIALS = {
   },
 };
 
-export async function ensureCredentials() {
-  if (await platform().credentialsExist()) return;
+export async function ensureCredentials(allowSetup = true): Promise<boolean> {
+  if (await platform().credentialsExist()) return true;
+
+  if (!allowSetup) {
+    p.log.error("Non-persistent mode requires existing Claude credentials; log in under a separate OS account first.");
+    return false;
+  }
 
   p.log.warn(
     "No Claude credentials found. Claude needs this to think you're logged in.",
@@ -65,11 +70,12 @@ export async function ensureCredentials() {
   });
   if (p.isCancel(confirm) || !confirm) {
     p.log.warn("Skipping credentials setup. Claude may redirect you to login.");
-    return;
+    return true;
   }
 
   await platform().writeOAuthCredentials(PLACEHOLDER_CREDENTIALS);
   p.log.success("Placeholder credentials created.");
+  return true;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -99,7 +105,15 @@ export async function sessionPost(
     timeout: 5_000,
     ca: caPem,
   });
-  return r.ok ? (r.json() as Promise<Record<string, unknown>>) : {};
+  if (r.ok) return r.json() as Promise<Record<string, unknown>>;
+  let message = `HTTP ${r.status}`;
+  try {
+    const body = await r.json() as { error?: unknown };
+    if (typeof body.error === "string") message = body.error;
+  } catch {
+    // Older servers can return a plain-text error.
+  }
+  throw new Error(message);
 }
 
 // ── Launch ────────────────────────────────────────────────────────────────────
@@ -115,6 +129,7 @@ export async function launchClaude(
   },
   claudeArgs: string[] = [],
   sharerAccount: SharerAccount | null = null,
+  persist = true,
 ) {
   if (!(await checkClaudeInstalled())) {
     p.log.error("Claude Code is not installed or not in PATH.");
@@ -122,8 +137,11 @@ export async function launchClaude(
     process.exit(1);
   }
 
-  ensureOnboarding();
-  await ensureCredentials();
+  if (persist) ensureOnboarding();
+  if (!(await ensureCredentials(persist))) {
+    process.exitCode = 1;
+    return;
+  }
 
   if (sharerAccount) {
     p.log.info(
@@ -131,7 +149,8 @@ export async function launchClaude(
     );
   }
 
-  const tmpCert = path.join(os.tmpdir(), `claude-share-ca-${Date.now()}.pem`);
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-connect-"));
+  const tmpCert = path.join(tmpDir, "ca.pem");
   fs.writeFileSync(tmpCert, caPem, { mode: 0o600 });
 
   const proxyAuth =
@@ -139,39 +158,32 @@ export async function launchClaude(
     Buffer.from(`${meta.proxyUser}:${meta.proxyPass}`).toString("base64");
 
   // Register this Claude session with the sharer
-  let sessionId: string | null = null;
+  let sessionId: string;
+  let sessionProxyUser: string;
+  let sessionProxyPass: string;
   try {
     const res = await sessionPost(
       proxyUrl,
       "/session/start",
-      { machineId: meta.id },
+      {},
       caPem,
       proxyAuth,
     );
-    sessionId = (res["sessionId"] as string) ?? null;
-    if (!sessionId)
-      logger.warn("session/start returned no sessionId", {
-        machineId: meta.id,
-      });
+    if (typeof res.sessionId !== "string" ||
+        typeof res.proxyUser !== "string" || typeof res.proxyPass !== "string") {
+      throw new Error("Server did not return session credentials; re-pair with an updated sharer");
+    }
+    sessionId = res.sessionId;
+    sessionProxyUser = res.proxyUser;
+    sessionProxyPass = res.proxyPass;
   } catch (err) {
     logger.error("session/start failed", err);
+    p.log.error(`Cannot start session: ${(err as Error).message}`);
+    fs.unlinkSync(tmpCert);
+    fs.rmdirSync(tmpDir);
+    process.exitCode = 1;
+    return;
   }
-
-  // 30-second heartbeat so sharer sees lastActiveAt update
-  const heartbeat = sessionId
-    ? setInterval(() => {
-        void sessionPost(
-          proxyUrl,
-          "/session/heartbeat",
-          {
-            machineId: meta.id,
-            sessionId: sessionId!,
-          },
-          caPem,
-          proxyAuth,
-        ).catch(() => {});
-      }, 30_000)
-    : null;
 
   p.log.success("\x1b[32mLaunching Claude...\x1b[0m");
 
@@ -183,8 +195,8 @@ export async function launchClaude(
   // requests to the MITM proxy after decryption, so the outer connection is
   // encrypted and proxy credentials are never sent in cleartext over the network.
   const parsedProxy = new URL(proxyUrl);
-  parsedProxy.username = encodeURIComponent(meta.proxyUser);
-  parsedProxy.password = encodeURIComponent(meta.proxyPass);
+  parsedProxy.username = encodeURIComponent(sessionProxyUser);
+  parsedProxy.password = encodeURIComponent(sessionProxyPass);
   const httpProxyUrl = parsedProxy.toString();
 
   const child = spawn("claude", claudeArgs, {
@@ -199,25 +211,36 @@ export async function launchClaude(
     },
   });
 
+  let heartbeatFailed = false;
+  let cleaningUp = false;
+  const heartbeat = setInterval(() => {
+    void sessionPost(proxyUrl, "/session/heartbeat", { sessionId }, caPem, proxyAuth)
+      .catch((err) => {
+        if (heartbeatFailed || cleaningUp) return;
+        heartbeatFailed = true;
+        logger.error("Session heartbeat failed", err);
+        p.log.error(`Session ended: ${(err as Error).message}`);
+        child.kill("SIGTERM");
+      });
+  }, 30_000);
+
   async function cleanupAndExit(code: number | null) {
-    if (heartbeat) clearInterval(heartbeat);
-    if (sessionId) {
-      await sessionPost(
-        proxyUrl,
-        "/session/end",
-        { machineId: meta.id, sessionId },
-        caPem,
-        proxyAuth,
-      ).catch(() => {});
-    }
+    if (cleaningUp) return;
+    cleaningUp = true;
+    clearInterval(heartbeat);
+    await sessionPost(proxyUrl, "/session/end", { sessionId }, caPem, proxyAuth)
+      .catch((err) => logger.warn("Could not end session", err));
     try {
       fs.unlinkSync(tmpCert);
-    } catch {}
+      fs.rmdirSync(tmpDir);
+    } catch (err) {
+      logger.warn("Could not remove temporary CA files", err);
+    }
     const duration = Math.floor((Date.now() - startTime) / 1000);
     const mins = Math.floor(duration / 60);
     const secs = duration % 60;
     p.log.info(`Session ended. Duration: ${mins}m ${secs}s`);
-    process.exit(code ?? 0);
+    process.exit(heartbeatFailed ? 1 : (code ?? 0));
   }
 
   child.on("exit", (code) => {
@@ -230,20 +253,7 @@ export async function launchClaude(
     p.log.warn(
       "Is 'claude' installed? Run: npm install -g @anthropic-ai/claude-code",
     );
-    if (heartbeat) clearInterval(heartbeat);
-    if (sessionId) {
-      void sessionPost(
-        proxyUrl,
-        "/session/end",
-        { machineId: meta.id, sessionId },
-        caPem,
-        proxyAuth,
-      ).catch(() => {});
-    }
-    try {
-      fs.unlinkSync(tmpCert);
-    } catch {}
-    process.exit(1);
+    void cleanupAndExit(1);
   });
 
   process.on("SIGINT", () => child.kill("SIGINT"));

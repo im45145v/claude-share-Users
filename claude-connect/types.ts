@@ -14,6 +14,7 @@ export interface SavedConnection {
   sharerAccount: SharerAccount | null;
   proxyUser: string;
   proxyPass: string;
+  userName?: string;
 }
 
 export interface ReceiverConfig {

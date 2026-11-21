@@ -1,21 +1,16 @@
-import fs from "node:fs";
-
 import * as p from "@clack/prompts";
 
 import { apiFetch } from "../fetch";
 import { launchClaude } from "../launch";
 import { logger } from "../logger";
 import { decryptBlob, parseConnectUrl } from "../pairing";
-import {
-  connectionPath,
-  ensureConnectionsDir,
-  getDeviceName,
-} from "../storage";
+import { getDeviceName, saveConnection } from "../storage";
 import type { ConnectionFile, SavedConnection } from "../types";
 
 export async function pairFlow(
   prefill?: { serverUrl: string; pairingCode: string },
   claudeArgs: string[] = [],
+  persist = true,
 ) {
   p.intro("claude-connect — pair with a new sharer");
 
@@ -58,7 +53,7 @@ export async function pairFlow(
     }
   }
 
-  const name = getDeviceName();
+  const name = getDeviceName(persist);
   p.log.info(`Connecting as "${name}"`);
 
   const spin = p.spinner();
@@ -115,7 +110,6 @@ export async function pairFlow(
 
   spin.stop("Paired successfully.");
 
-  ensureConnectionsDir();
   const saved: SavedConnection = {
     id: connectionId,
     systemName: file.systemName ?? new URL(serverUrl).hostname,
@@ -128,11 +122,9 @@ export async function pairFlow(
     sharerAccount: file.sharerAccount ?? null,
     proxyUser: file.proxyUser,
     proxyPass: file.proxyPass,
+    userName: file.userName,
   };
-  fs.writeFileSync(
-    connectionPath(connectionId),
-    JSON.stringify(saved, null, 2),
-  );
+  if (persist) saveConnection(saved);
 
   await launchClaude(
     serverUrl,
@@ -140,5 +132,6 @@ export async function pairFlow(
     saved,
     claudeArgs,
     file.sharerAccount ?? null,
+    persist,
   );
 }

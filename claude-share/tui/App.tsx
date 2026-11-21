@@ -8,10 +8,11 @@ import {
   type Machine,
   type Session,
 } from "../session/manager.js";
+import type { ShareUser } from "../session/users.js";
 
 const IS_DEV = process.env.NODE_ENV === "development";
 
-type View = "pairing" | "machines" | "sessions";
+type View = "pairing" | "machines" | "sessions" | "users" | "user-name" | "user-limit" | "confirm-revoke";
 
 function formatDuration(from: Date): string {
   const secs = Math.floor((Date.now() - from.getTime()) / 1000);
@@ -95,11 +96,16 @@ export function App({
   onExit,
 }: Props) {
   const { exit } = useApp();
-  const [view, setView] = useState<View>("pairing");
+  const [view, setView] = useState<View>("users");
   const [pairingCode, setPairingCode] = useState(
     () => getSession()?.pairingCode ?? "",
   );
   const [machines, setMachines] = useState<Machine[]>([]);
+  const [users, setUsers] = useState<ShareUser[]>(() => getSession()?.users.list() ?? []);
+  const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
+  const [draftName, setDraftName] = useState("");
+  const [inputValue, setInputValue] = useState("");
+  const [notice, setNotice] = useState("");
   const [cursorIdx, setCursorIdx] = useState(0);
   const [selectedMachineId, setSelectedMachineId] = useState<string | null>(
     null,
@@ -112,16 +118,18 @@ export function App({
       if (!session) return;
       setPairingCode(session.pairingCode);
       setMachines([...session.machines.values()]);
+      setUsers(session.users.list());
       if (session.pairingCodeUsed) {
-        setView((v) => (v === "pairing" ? "machines" : v));
+        setView((v) => (v === "pairing" ? "users" : v));
       }
     }, 1000);
     return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
-    setCursorIdx((i) => Math.min(i, Math.max(0, machines.length - 1)));
-  }, [machines.length]);
+    const count = view === "users" ? users.length : machines.length;
+    setCursorIdx((i) => Math.min(i, Math.max(0, count - 1)));
+  }, [machines.length, users.length, view]);
 
   const connectUrl = useCallback(
     (base: string) =>
@@ -130,9 +138,108 @@ export function App({
   );
 
   useInput((input, key) => {
+    const session = getSession();
+    if (!session) return;
+    if (view === "user-name" || view === "user-limit") {
+      if (key.escape) {
+        setView("users");
+        setInputValue("");
+        return;
+      }
+      if (key.return) {
+        if (view === "user-name") {
+          if (!inputValue.trim()) {
+            setNotice("Enter a user name.");
+            return;
+          }
+          setDraftName(inputValue.trim());
+          setInputValue("1");
+          setNotice("");
+          setView("user-limit");
+        } else {
+          const limit = Number(inputValue);
+          if (!/^[0-9]+$/.test(inputValue) || !Number.isSafeInteger(limit) || limit < 1) {
+            setNotice("Enter a positive whole-number session limit.");
+            return;
+          }
+          try {
+            if (selectedUserId) session.users.update(selectedUserId, { sessionLimit: limit });
+            else session.users.create(draftName, limit);
+            setUsers(session.users.list());
+            setNotice(selectedUserId ? "Limit updated." : "User created.");
+            setInputValue("");
+            setView("users");
+          } catch (error) {
+            setNotice((error as Error).message);
+          }
+        }
+        return;
+      }
+      if (key.backspace || key.delete) setInputValue((value) => value.slice(0, -1));
+      else if (!key.ctrl && !key.meta && input && !/[\x00-\x1f\x7f]/.test(input))
+        setInputValue((value) => (value + input).slice(0, view === "user-name" ? 80 : 9));
+      return;
+    }
+
+    if (view === "confirm-revoke") {
+      if (input === "y" && selectedUserId) {
+        try {
+          session.users.update(selectedUserId, { status: "revoked" });
+          setUsers(session.users.list());
+          setNotice("User revoked; active sessions disconnected.");
+        } catch (error) {
+          setNotice((error as Error).message);
+        }
+      }
+      if (input === "y" || input === "n" || key.escape) setView("users");
+      return;
+    }
+
     if (input === "q" || (key.ctrl && input === "c")) {
       onExit();
       exit();
+      return;
+    }
+
+    if (view === "users") {
+      if (key.upArrow) setCursorIdx((i) => Math.max(0, i - 1));
+      if (key.downArrow) setCursorIdx((i) => Math.min(users.length - 1, i + 1));
+      const selected = users[cursorIdx];
+      if (input === "a") {
+        setSelectedUserId(null);
+        setInputValue("");
+        setNotice("");
+        setView("user-name");
+      } else if (input === "m") {
+        setCursorIdx(0);
+        setView("machines");
+      } else if (selected && input === "l") {
+        setSelectedUserId(selected.id);
+        setInputValue(String(selected.sessionLimit));
+        setNotice("");
+        setView("user-limit");
+      } else if (selected && input === "r" && selected.status !== "revoked") {
+        setSelectedUserId(selected.id);
+        setView("confirm-revoke");
+      } else if (selected && (input === "d" || input === "e")) {
+        try {
+          session.users.update(selected.id, { status: input === "d" ? "disabled" : "enabled" });
+          setUsers(session.users.list());
+          setNotice(input === "d" ? "User disabled; active sessions disconnected." : "User enabled.");
+        } catch (error) {
+          setNotice((error as Error).message);
+        }
+      } else if (selected && input === "n") {
+        try {
+          regeneratePairingCode(session, selected.id);
+          setSelectedUserId(selected.id);
+          setPairingCode(session.pairingCode);
+          setNotice("");
+          setView("pairing");
+        } catch (error) {
+          setNotice((error as Error).message);
+        }
+      }
       return;
     }
 
@@ -150,15 +257,15 @@ export function App({
       if (view === "sessions") {
         setView("machines");
         setSelectedMachineId(null);
-      } else if (view === "pairing" && machines.length > 0) {
-        setView("machines");
+      } else if (view === "pairing" || view === "machines") {
+        setView("users");
+        setCursorIdx(0);
       }
     }
 
     if (input === "n" && view !== "pairing") {
-      const session = getSession();
-      if (session) regeneratePairingCode(session);
-      setView("pairing");
+      setView("users");
+      setCursorIdx(0);
       setSelectedMachineId(null);
     }
 
@@ -203,7 +310,7 @@ export function App({
           paddingY={1}
         >
           <Text bold color="green">
-            Waiting for a machine to connect…
+            Invitation for {users.find((user) => user.id === selectedUserId)?.name}
           </Text>
           <Box flexDirection="column" marginTop={1} gap={0}>
             {publicUrl ? (
@@ -231,7 +338,7 @@ export function App({
             )}
           </Box>
           <Box flexDirection="column" marginTop={1} gap={0}>
-            <Text dimColor>One-time code — only one machine can use it.</Text>
+            <Text dimColor>One-time invitation — only one enrollment can use it.</Text>
             <Text dimColor>
               Ask your friend to run <Text color="white">claude-connect</Text>{" "}
               and paste the link above.
@@ -239,6 +346,28 @@ export function App({
           </Box>
         </Box>
       )}
+
+      {view === "users" && (
+        <Box flexDirection="column">
+          <Text bold>Users ({users.length})</Text>
+          {users.length === 0 && <Text dimColor>No users yet. Press a to create one.</Text>}
+          {users.map((user, i) => {
+            const active = machines.filter((machine) => machine.userId === user.id)
+              .reduce((count, machine) => count + [...machine.sessions.values()].filter((s) => s.active).length, 0);
+            return (
+              <Text key={user.id} color={i === cursorIdx ? "cyan" : undefined}>
+                {i === cursorIdx ? "›" : " "} {user.name} ({user.id.slice(0, 8)}) — {user.status} — {active}/{user.sessionLimit} sessions
+              </Text>
+            );
+          })}
+        </Box>
+      )}
+      {view === "user-name" && <Text>User name: {inputValue}▏</Text>}
+      {view === "user-limit" && <Text>Concurrent session limit: {inputValue}▏</Text>}
+      {view === "confirm-revoke" && (
+        <Text color="red">Permanently revoke {users.find((user) => user.id === selectedUserId)?.name}? y/n</Text>
+      )}
+      {!!notice && <Text color="yellow">{notice}</Text>}
 
       {/* Machines list */}
       {view === "machines" && (
@@ -259,7 +388,7 @@ export function App({
                     {cursor ? "›" : " "}
                   </Text>
                   <Text color={active ? "green" : "yellow"}>●</Text>
-                  <Text bold={cursor}>{m.name}</Text>
+                  <Text bold={cursor}>{users.find((user) => user.id === m.userId)?.name ?? "Unknown"} — {m.name}</Text>
                   <Text dimColor>— {formatRelative(last)}</Text>
                 </Box>
               );
@@ -294,6 +423,10 @@ export function App({
       {/* Footer */}
       <Box marginTop={1} gap={2}>
         <Text dimColor>q quit</Text>
+        {view === "users" && (
+          <Text dimColor>↑↓ select · a add · n invite · l limit · d disable · e enable · r revoke · m devices</Text>
+        )}
+        {(view === "user-name" || view === "user-limit") && <Text dimColor>enter confirm · esc cancel</Text>}
         {view === "pairing" && machines.length > 0 && (
           <Text dimColor>esc back</Text>
         )}
@@ -304,9 +437,9 @@ export function App({
             <Text dimColor>c copy url</Text>
           ))}
         {view === "machines" && (
-          <Text dimColor>↑↓ select · enter view sessions · n new pairing</Text>
+          <Text dimColor>↑↓ select · enter view sessions · n users · esc back</Text>
         )}
-        {view === "sessions" && <Text dimColor>esc back · n new pairing</Text>}
+        {view === "sessions" && <Text dimColor>esc back · n users</Text>}
       </Box>
     </Box>
   );
